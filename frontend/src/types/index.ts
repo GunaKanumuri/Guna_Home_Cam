@@ -8,6 +8,9 @@ export interface SurveillanceEvent {
     camera: string;
     priority: PriorityLevel;
     message: string;
+    message_te?: string;
+    person?: string;
+    confidence?: number;
     hazard: boolean;
     family: string | null;
     snapshot_url?: string;

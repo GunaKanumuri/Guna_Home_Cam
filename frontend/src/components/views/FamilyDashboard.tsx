@@ -149,12 +149,14 @@ export default function FamilyDashboard({ events, systemState, cameras, connecte
                                 <span className="text-2xl shrink-0 ml-1">{eventIcon(event)}</span>
                                 <div className="flex-1 min-w-0">
                                     <p className="text-[13px] font-semibold text-warm-800 leading-snug">{event.message}</p>
+                                    {event.message_te && (
+                                        <p className="text-[12px] text-warm-500 leading-snug mt-0.5">{event.message_te}</p>
+                                    )}
                                     <p className="text-[11px] text-warm-400 mt-1 font-mono">{event.camera} · {event.timestamp}</p>
                                 </div>
-                                {event.family && (
-                                    <span className="shrink-0 bg-gold-50 text-gold-600 text-[10px] font-bold px-2.5 py-1 rounded-full border border-gold-200">
-                                        {event.family}
-                                    </span>
+                                {event.snapshot_url && (
+                                    <img src={event.snapshot_url} alt="snapshot" loading="lazy"
+                                        className="shrink-0 w-14 h-14 rounded-xl object-cover border border-warm-100" />
                                 )}
                             </div>
                         ))

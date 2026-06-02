@@ -1,12 +1,16 @@
 // src/App.tsx
 import { useState, useEffect } from 'react';
 import { useSurveillance } from './hooks/useSurveillance';
+import { useAuthContext } from './auth/AuthContext';
+import type { Role } from './hooks/useAuth';
 import LiveFeed from './components/views/LiveFeed';
 import FamilyDashboard from './components/views/FamilyDashboard';
 import AccessControl from './components/views/AccessControl';
 import Settings from './components/views/Settings';
 
 type View = 'family' | 'feed' | 'access' | 'settings';
+
+const ROLE_RANK: Record<Role, number> = { viewer: 1, editor: 2, owner: 3 };
 
 /* ── Inline SVG Icons ── */
 function IconShield({ className = '' }: { className?: string }) {
@@ -43,8 +47,12 @@ function IconSettings({ className = '' }: { className?: string }) {
 
 export default function App() {
     const { events, systemState, connected, cameras, config, toggleSystemPower, updateConfig, purgeEvents, sendFamilyAlert } = useSurveillance();
+    const { role, member, lock } = useAuthContext();
     const [activeView, setActiveView] = useState<View>('family');
     const [clock, setClock] = useState('');
+
+    const myRank   = ROLE_RANK[role ?? 'viewer'];
+    const canManage = myRank >= ROLE_RANK.editor;   // editor/owner can pause + edit settings
 
     const urgentCount = events.filter(e => e.priority === 'urgent').length;
 
@@ -61,12 +69,14 @@ export default function App() {
         return () => clearInterval(id);
     }, []);
 
-    const navItems: { id: View; label: string; desc: string; icon: typeof IconShield; adminOnly?: boolean }[] = [
-        { id: 'family',   label: 'Home',       desc: 'Safety at a glance',   icon: IconShield },
-        { id: 'feed',     label: 'Camera Log', desc: 'All detections',       icon: IconCamera,   adminOnly: true },
-        { id: 'access',   label: 'Devices',    desc: 'Access control',       icon: IconUsers,    adminOnly: true },
-        { id: 'settings', label: 'Settings',   desc: 'Preferences',          icon: IconSettings, adminOnly: true },
+    const navItems: { id: View; label: string; desc: string; icon: typeof IconShield; minRole: Role }[] = [
+        { id: 'family',   label: 'Home',       desc: 'Safety at a glance',   icon: IconShield,   minRole: 'viewer' },
+        { id: 'feed',     label: 'Camera Log', desc: 'All detections',       icon: IconCamera,   minRole: 'viewer' },
+        { id: 'settings', label: 'Settings',   desc: 'Preferences',          icon: IconSettings, minRole: 'editor' },
+        { id: 'access',   label: 'Devices',    desc: 'Access control',       icon: IconUsers,    minRole: 'owner'  },
     ];
+    const visibleNav = navItems.filter(n => myRank >= ROLE_RANK[n.minRole]);
+    const firstAdminId = visibleNav.find(n => n.minRole !== 'viewer')?.id;
 
     return (
         <div className="h-full flex flex-col md:flex-row bg-luxury font-sans">
@@ -100,12 +110,12 @@ export default function App() {
 
                 {/* Nav */}
                 <nav className="flex-1 px-3 pt-4 space-y-0.5">
-                    {navItems.map((item, i) => {
+                    {visibleNav.map((item) => {
                         const Icon = item.icon;
                         const isActive = activeView === item.id;
                         return (
                             <div key={item.id}>
-                                {item.adminOnly && i > 0 && !navItems[i-1].adminOnly && (
+                                {item.id === firstAdminId && (
                                     <p className="text-[10px] font-semibold text-warm-300 uppercase tracking-[0.15em] px-3 pt-5 pb-2">
                                         Admin
                                     </p>
@@ -137,18 +147,30 @@ export default function App() {
                     })}
                 </nav>
 
-                {/* Power + clock */}
+                {/* Identity + power + lock */}
                 <div className="p-4 space-y-3">
                     <div className="gold-divider" />
-                    <button
-                        onClick={toggleSystemPower}
-                        className={`w-full py-2.5 rounded-xl text-sm font-semibold transition-all duration-300 border ${
-                            systemState.status === 'Active'
-                                ? 'bg-ruby-light text-ruby border-ruby-border hover:bg-red-50'
-                                : 'bg-forest-light text-forest border-forest-border hover:bg-emerald-50'
-                        }`}
-                    >
-                        {systemState.status === 'Active' ? '⏸  Pause Monitoring' : '▶  Start Monitoring'}
+                    {member && (
+                        <div className="flex items-center justify-between px-1">
+                            <span className="text-[12px] font-semibold text-warm-700 truncate">{member.name}</span>
+                            <span className="text-[9px] font-mono uppercase tracking-wider px-2 py-0.5 rounded-full bg-gold-50 text-gold-600 border border-gold-200">{role}</span>
+                        </div>
+                    )}
+                    {canManage && (
+                        <button
+                            onClick={toggleSystemPower}
+                            className={`w-full py-2.5 rounded-xl text-sm font-semibold transition-all duration-300 border ${
+                                systemState.status === 'Active'
+                                    ? 'bg-ruby-light text-ruby border-ruby-border hover:bg-red-50'
+                                    : 'bg-forest-light text-forest border-forest-border hover:bg-emerald-50'
+                            }`}
+                        >
+                            {systemState.status === 'Active' ? '⏸  Pause Monitoring' : '▶  Start Monitoring'}
+                        </button>
+                    )}
+                    <button onClick={lock}
+                        className="w-full py-2 rounded-xl text-[12px] font-semibold text-warm-500 hover:text-warm-700 border border-warm-200 hover:bg-warm-50 transition-all">
+                        🔒 Lock
                     </button>
                     <p className="text-center text-[10px] text-warm-300 font-mono tracking-wider">{clock}</p>
                 </div>
@@ -188,7 +210,7 @@ export default function App() {
                         <span className="hidden md:block text-[11px] text-warm-400 font-mono">{clock}</span>
                         <button
                             onClick={toggleSystemPower}
-                            className={`md:hidden px-3 py-1.5 rounded-lg text-[11px] font-bold border transition-all ${
+                            className={`md:hidden px-3 py-1.5 rounded-lg text-[11px] font-bold border transition-all ${!canManage ? 'hidden' : ''} ${
                                 systemState.status === 'Active'
                                     ? 'bg-ruby-light text-ruby border-ruby-border'
                                     : 'bg-forest-light text-forest border-forest-border'
@@ -214,7 +236,7 @@ export default function App() {
 
             {/* ── Mobile Bottom Nav ── */}
             <nav className="md:hidden fixed bottom-0 inset-x-0 bg-white/95 backdrop-blur-2xl border-t border-warm-100 flex items-stretch z-50 shadow-[0_-4px_20px_rgba(139,111,42,0.06)]">
-                {navItems.map(item => {
+                {visibleNav.map(item => {
                     const Icon = item.icon;
                     const isActive = activeView === item.id;
                     return (

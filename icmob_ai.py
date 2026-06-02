@@ -71,6 +71,11 @@ def _load_config() -> dict:
             "token": os.getenv("NTFY_TOKEN", ""),
         },
         "telegram": {"enabled": False, "bot_token": "", "chat_id": ""},
+        "supabase": {"enabled": False, "url": "", "service_key": "", "bucket": "snapshots"},
+        "notifications": {
+            "languages": ["en", "te"],
+            "attach_snapshot": True,
+        },
         "monitoring": {
             "scan_interval_sec": 15,
             "loiter_check_delay_sec": 4,
@@ -139,6 +144,19 @@ NTFY_TOKEN        = CFG["ntfy"]["token"]
 TELE_ENABLED      = CFG["telegram"]["enabled"]
 TELE_BOT_TOKEN    = CFG["telegram"]["bot_token"]
 TELE_CHAT_ID      = CFG["telegram"]["chat_id"]
+NOTIFY            = CFG.get("notifications", {})
+NOTIFY_LANGS      = NOTIFY.get("languages", ["en", "te"])
+ATTACH_SNAP       = NOTIFY.get("attach_snapshot", True)
+LANG_NAMES        = {
+    "en": "English", "te": "Telugu", "hi": "Hindi", "ta": "Tamil",
+    "kn": "Kannada", "ml": "Malayalam", "mr": "Marathi", "bn": "Bengali",
+}
+SECONDARY_LANGS   = [l for l in NOTIFY_LANGS if l != "en"]
+SB                = CFG.get("supabase", {})
+SB_URL            = SB.get("url", "").rstrip("/")
+SB_KEY            = SB.get("service_key", "")
+SB_BUCKET         = SB.get("bucket", "snapshots")
+SB_ENABLED        = bool(SB.get("enabled", False) and SB_URL and SB_KEY)
 MON               = CFG["monitoring"]
 SCAN_INTERVAL     = MON["scan_interval_sec"]
 LOITER_DELAY      = MON["loiter_check_delay_sec"]
@@ -154,6 +172,9 @@ MAX_DEBUG         = MON["max_debug_files"]
 MULTI_FRAMES      = MON["multi_frame_count"]
 MULTI_INTERVAL_MS = MON["multi_frame_interval_ms"]
 BACKOFF_STEPS     = MON["backoff_steps_sec"]
+QUIET_GAP_SEC        = MON.get("quiet_gap_sec", 300)
+EP_REMINDER_SEC      = MON.get("episode_reminder_sec", 900)
+ALERT_ON_DESC_CHANGE = MON.get("alert_on_description_change", True)
 IQ                = CFG["image_quality"]
 DAY_SIZE          = tuple(IQ["day_max_size"])
 DAY_QUAL          = IQ["day_jpeg_quality"]
@@ -383,6 +404,63 @@ def _check_correlation(camera: dict, result: dict) -> str | None:
     return None
 
 # ═══════════════════════════════════════════════════════════════════════
+#  PRESENCE / EPISODE DEBOUNCING — same person pacing ≠ many alerts
+# ═══════════════════════════════════════════════════════════════════════
+
+_presence: dict[str, dict] = {}
+_presence_lock = Lock()
+
+
+def _person_sig(desc: str) -> str:
+    """Coarse signature: female / male / unknown. Used only to catch a
+    clearly different person appearing during the same activity episode."""
+    d = (desc or "").lower()
+    if any(w in d for w in ("woman", "girl", "lady", "female")):
+        return "f"
+    if any(w in d for w in ("man", "boy", "male", "gentleman")):
+        return "m"
+    return "?"
+
+
+def _episode_gate(cam_id: str, person_desc: str, now: float) -> tuple[bool, str]:
+    """Group repeated sightings into one 'presence episode'.
+
+    - First person after a quiet stretch     -> alert ("new presence")
+    - Same ongoing activity (mom pacing)      -> stay quiet
+    - Gender clearly changes mid-episode      -> alert ("different person")
+    - Long-running episode                    -> one periodic "still active" ping
+    """
+    sig = _person_sig(person_desc)
+    with _presence_lock:
+        st = _presence.get(cam_id)
+        if st is None:
+            st = {"last_seen": 0.0, "ep_last_alert": 0.0, "ep_sig": sig}
+            _presence[cam_id] = st
+
+        gap = now - st["last_seen"]
+        st["last_seen"] = now
+
+        # New episode — nobody seen for a while
+        if gap > QUIET_GAP_SEC:
+            st["ep_last_alert"] = now
+            st["ep_sig"] = sig
+            return True, "new presence"
+
+        # A clearly different-looking person during the same episode
+        if (ALERT_ON_DESC_CHANGE and sig != "?" and st["ep_sig"] != "?"
+                and sig != st["ep_sig"]):
+            st["ep_sig"] = sig
+            st["ep_last_alert"] = now
+            return True, "different person"
+
+        # Long episode — periodic "still active" reminder
+        if now - st["ep_last_alert"] >= EP_REMINDER_SEC:
+            st["ep_last_alert"] = now
+            return True, "still active"
+
+        return False, "same episode"
+
+# ═══════════════════════════════════════════════════════════════════════
 #  GEMINI AI
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -440,6 +518,27 @@ If NOT sure → EVENT: person_detected (safer)"""
     # Multi-frame note
     frame_note = "Multiple frames over ~1 second — look for MOVEMENT between them.\n" if MULTI_FRAMES > 1 else ""
 
+    # [te] Multilingual output — extra lines + rules (e.g. Telugu)
+    loc_format = ""
+    loc_rules  = ""
+    if SECONDARY_LANGS:
+        fmt = []
+        for code in SECONDARY_LANGS:
+            up    = code.upper()
+            lname = LANG_NAMES.get(code, code)
+            fmt.append(f"SUMMARY_{up}: [the SUMMARY translated into {lname}, written in native {lname} script]")
+            fmt.append(f"PERSON_{up}: [the PERSON description translated into {lname}, native script; write none if no person]")
+        loc_format = "\n" + "\n".join(fmt)
+        langs_h = ", ".join(LANG_NAMES.get(c, c) for c in SECONDARY_LANGS)
+        loc_rules = (
+            "\n━━━ LANGUAGE RULES ━━━\n"
+            "- EVENT, ALERT, PRIORITY, CONFIDENCE stay in English exactly as specified.\n"
+            "- SUMMARY and PERSON are in English.\n"
+            f"- Also provide {langs_h} versions in the *_xx lines above, in native script (not transliteration).\n"
+            "- Translate naturally, the way a family member would read it on a phone alert.\n"
+            "- If PERSON is none, the translated PERSON line is also none."
+        )
+
     return f"""{ctx}
 {img_ctx}
 {family_ctx}
@@ -454,7 +553,7 @@ ALERT: [yes | no]
 SUMMARY: [short notification text, max 12 words, plain English]
 PERSON: [detailed description — see rules below]
 PRIORITY: [urgent | high | medium | low]
-CONFIDENCE: [0-100]
+CONFIDENCE: [0-100]{loc_format}
 
 ━━━ EVENT RULES ━━━
 - person_detected: ANY unknown person — walking, standing, passing by, at door, on stairs
@@ -495,6 +594,7 @@ BAD (never write — too vague):
 
 If no person: none
 If too dark or blurry: "person visible but image unclear — check DVR"
+{loc_rules}
 """
 
 
@@ -552,11 +652,14 @@ def _parse_response(text: str) -> dict | None:
         if ":" in line:
             k, _, v = line.partition(":")
             key = k.strip().upper()
-            if key in ("EVENT", "ALERT", "SUMMARY", "PERSON", "PRIORITY", "CONFIDENCE"):
+            if key in ("EVENT", "ALERT", "SUMMARY", "PERSON", "PRIORITY", "CONFIDENCE") \
+               or key.startswith("SUMMARY_") or key.startswith("PERSON_"):
                 result[key] = v.strip()
     if "EVENT" not in result:
         return None
     result["EVENT"] = _normalize_event(result["EVENT"])
+    if not FAMILY_MEMBERS and result["EVENT"] == "family_member":
+        result["EVENT"] = "person_detected"
     try:
         c = int(result.get("CONFIDENCE", "0"))
         result["CONFIDENCE"] = c if c > 0 else 80
@@ -566,6 +669,10 @@ def _parse_response(text: str) -> dict | None:
     result.setdefault("ALERT",    "no")
     result.setdefault("PRIORITY", "medium")
     result.setdefault("SUMMARY",  "Activity detected")
+    for code in SECONDARY_LANGS:
+        up = code.upper()
+        result.setdefault(f"SUMMARY_{up}", result.get("SUMMARY", ""))
+        result.setdefault(f"PERSON_{up}",  result.get("PERSON", "none"))
     return result
 
 
@@ -740,19 +847,13 @@ def _replay_pending():
         for line in lines:
             try:
                 data = json.loads(line)
-                headers = {
-                    "Title":    data.get("title", "iCMOB"),
-                    "Tags":     data.get("tags", "bell"),
-                    "Priority": str(data.get("priority", "3")),
-                    "Message":  data.get("message", ""),
-                }
-                if NTFY_TOKEN:
-                    headers["Authorization"] = f"Bearer {NTFY_TOKEN}"
-                r = requests.post(
-                    f"{NTFY_SERVER}/{NTFY_TOPIC}",
-                    headers=headers, timeout=10
+                ok = _ntfy_post_json(
+                    data.get("title", "iCMOB"),
+                    data.get("message", ""),
+                    data.get("tags", "bell"),
+                    int(data.get("priority", 3)),
                 )
-                if r.status_code in (200, 201):
+                if ok:
                     sent += 1
                 else:
                     failed.append(line)
@@ -777,6 +878,50 @@ def _ntfy_auth() -> dict:
     return {"Authorization": f"Bearer {NTFY_TOKEN}"} if NTFY_TOKEN else {}
 
 
+def _ascii_safe(s: str) -> str:
+    """HTTP headers must be latin-1. Strip anything that isn't (emoji, Telugu)."""
+    try:
+        s.encode("latin-1")
+        return s
+    except (UnicodeEncodeError, AttributeError):
+        cleaned = s.encode("ascii", "ignore").decode().strip()
+        return cleaned or "Alert"
+
+
+def _ntfy_post_json(title: str, message: str, tags, priority) -> bool:
+    """UTF-8 safe publish via ntfy's JSON endpoint — handles Telugu + emoji.
+
+    Text goes in the JSON body (not HTTP headers), so non-ASCII is preserved.
+    """
+    payload = {
+        "topic":    NTFY_TOPIC,
+        "message":  message,
+        "priority": int(priority),
+    }
+    if title:
+        payload["title"] = title
+    if tags:
+        payload["tags"] = tags if isinstance(tags, list) else [tags]
+    r = requests.post(NTFY_SERVER, json=payload, headers=_ntfy_auth(), timeout=10)
+    return r.status_code in (200, 201)
+
+
+def _ntfy_put_image(title: str, img_bytes: bytes, tags, priority):
+    """Send a snapshot as a companion notification (ASCII-only headers)."""
+    headers = {
+        **_ntfy_auth(),
+        "Title":    _ascii_safe(title),
+        "Priority": str(priority),
+        "Filename": "snapshot.jpg",
+    }
+    if tags:
+        headers["Tags"] = ",".join(tags) if isinstance(tags, list) else str(tags)
+    requests.put(
+        f"{NTFY_SERVER}/{NTFY_TOPIC}", data=img_bytes,
+        headers=headers, timeout=15
+    )
+
+
 def _build_body(camera: dict, result: dict, score: float) -> str:
     summary = result.get("SUMMARY", "Activity detected")
     person  = result.get("PERSON", "none").strip()
@@ -784,10 +929,13 @@ def _build_body(camera: dict, result: dict, score: float) -> str:
     prio    = result.get("PRIORITY", "medium").lower()
     thresh  = camera.get("motion_threshold", 8.0)
 
-    if person and person.lower() not in ("none", "n/a", "", "none visible"):
-        body = f"{person.capitalize()} — {summary}"
-    else:
-        body = summary
+    def _line(p: str, s: str) -> str:
+        if p and p.lower() not in ("none", "n/a", "", "none visible"):
+            return f"{p.capitalize()} — {s}"
+        return s
+
+    # English (primary line)
+    body = _line(person, summary)
 
     corr = _check_correlation(camera, result)
     if corr:
@@ -804,6 +952,14 @@ def _build_body(camera: dict, result: dict, score: float) -> str:
     if prio == "urgent":
         body = "🚨 " + body
 
+    # Secondary languages (e.g. Telugu) — appended on their own line(s)
+    for code in SECONDARY_LANGS:
+        up = code.upper()
+        s2 = result.get(f"SUMMARY_{up}", "").strip()
+        p2 = result.get(f"PERSON_{up}", "none").strip()
+        if s2 and s2.lower() != summary.lower():
+            body += "\n" + _line(p2, s2)
+
     return body
 
 
@@ -814,44 +970,41 @@ def _send_ntfy(camera: dict, result: dict,
     event = result.get("EVENT", "unknown_activity")
     cfg   = EVENT_CONFIG.get(event, EVENT_CONFIG["unknown_activity"])
     body  = _build_body(camera, result, score)
-    headers = {
-        **_ntfy_auth(),
-        "Title":    camera["name"],
-        "Tags":     cfg["emoji"],
-        "Priority": str(cfg["ntfy_pri"]),
-        "Message":  body,
-    }
+    title = camera["name"]
+
+    sent = False
     for attempt in range(2):
         try:
-            if img:
-                buf = io.BytesIO()
-                img.save(buf, format="JPEG", quality=80)
-                buf.seek(0)
-                r = requests.put(
-                    f"{NTFY_SERVER}/{NTFY_TOPIC}", data=buf,
-                    headers={**headers, "Filename": "snapshot.jpg"}, timeout=10
-                )
-            else:
-                r = requests.post(
-                    f"{NTFY_SERVER}/{NTFY_TOPIC}",
-                    headers=headers, timeout=10
-                )
-            if r.status_code in (200, 201):
-                log.info(f"✅ Ntfy → [{camera['name']}] {body[:80]}")
-                return
+            if _ntfy_post_json(title, body, [cfg["emoji"]], cfg["ntfy_pri"]):
+                sent = True
+                log.info(f"✅ Ntfy → [{camera['name']}] {body.splitlines()[0][:80]}")
+                break
         except requests.exceptions.ConnectionError:
             pass
         except Exception as e:
             log.warning(f"Ntfy err (att {attempt+1}): {e}")
         if attempt == 0:
             time.sleep(3)
-    log.warning("❌ Ntfy failed — queuing")
-    _queue_notification({
-        "title":    camera["name"],
-        "tags":     cfg["emoji"],
-        "priority": cfg["ntfy_pri"],
-        "message":  f"[DELAYED] {body}",
-    })
+
+    if not sent:
+        log.warning("❌ Ntfy failed — queuing")
+        _queue_notification({
+            "title":    camera["name"],
+            "tags":     cfg["emoji"],
+            "priority": cfg["ntfy_pri"],
+            "message":  f"[DELAYED] {body}",
+        })
+        return
+
+    # Companion snapshot — ASCII-only headers, so it never breaks on Telugu
+    if img is not None and ATTACH_SNAP:
+        try:
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=80)
+            _ntfy_put_image(camera["name"], buf.getvalue(),
+                            [cfg["emoji"]], cfg["ntfy_pri"])
+        except Exception as e:
+            log.warning(f"Ntfy image: {e}")
 
 
 def _send_telegram(camera: dict, result: dict,
@@ -893,16 +1046,154 @@ def _ntfy_simple(title: str, msg: str, tags="bell", priority="2"):
     if not NTFY_ENABLED:
         return
     try:
-        requests.post(f"{NTFY_SERVER}/{NTFY_TOPIC}", headers={
-            **_ntfy_auth(),
-            "Title": title, "Tags": tags,
-            "Priority": priority, "Message": msg,
-        }, timeout=8)
+        if not _ntfy_post_json(title, msg, tags, int(priority)):
+            raise requests.exceptions.ConnectionError("non-2xx")
     except requests.exceptions.ConnectionError:
         _queue_notification({"title": title, "tags": tags,
                              "priority": int(priority), "message": msg})
     except Exception:
         pass
+
+# ═══════════════════════════════════════════════════════════════════════
+#  SUPABASE — cloud push so the dashboard sees detections from anywhere
+# ═══════════════════════════════════════════════════════════════════════
+
+def _sb_headers(extra: dict | None = None) -> dict:
+    h = {"apikey": SB_KEY, "Authorization": f"Bearer {SB_KEY}"}
+    if extra:
+        h.update(extra)
+    return h
+
+
+def _sb_ui_priority(event: str, ai_priority: str) -> str:
+    """Map detailed AI priority → the dashboard's 3 levels."""
+    if event == "intruder_detected":
+        return "urgent"
+    if event == "person_detected":
+        return "warning"
+    if ai_priority == "urgent":
+        return "urgent"
+    return "safe"
+
+
+def _sb_message(result: dict, lang: str) -> str:
+    if lang == "te":
+        p, s = result.get("PERSON_TE", "none"), result.get("SUMMARY_TE", "")
+    else:
+        p, s = result.get("PERSON", "none"), result.get("SUMMARY", "")
+    p, s = (p or "").strip(), (s or "").strip()
+    if p and p.lower() not in ("none", "n/a", "", "none visible"):
+        return f"{p} — {s}" if s else p
+    return s
+
+
+def _sb_upload_snapshot(eid: str, img_bytes: bytes) -> str | None:
+    """Upload a JPEG and return a long-lived signed URL (or None)."""
+    if not SB_ENABLED:
+        return None
+    path = f"{eid}.jpg"
+    try:
+        up = requests.post(
+            f"{SB_URL}/storage/v1/object/{SB_BUCKET}/{path}",
+            headers=_sb_headers({"Content-Type": "image/jpeg", "x-upsert": "true"}),
+            data=img_bytes, timeout=15)
+        if up.status_code not in (200, 201):
+            log.warning(f"SB upload {up.status_code}: {up.text[:120]}")
+            return None
+        sign = requests.post(
+            f"{SB_URL}/storage/v1/object/sign/{SB_BUCKET}/{path}",
+            headers=_sb_headers({"Content-Type": "application/json"}),
+            json={"expiresIn": 604800}, timeout=10)   # 7 days
+        if sign.status_code == 200:
+            return f"{SB_URL}/storage/v1{sign.json().get('signedURL', '')}"
+    except Exception as e:
+        log.warning(f"SB snapshot: {e}")
+    return None
+
+
+def _sb_insert_event(camera: dict, result: dict, eid: str,
+                     is_night: bool, snapshot_url: str | None):
+    if not SB_ENABLED:
+        return
+    event = result.get("EVENT", "")
+    row = {
+        "event_id":     eid,
+        "camera_id":    camera.get("id"),
+        "camera":       camera.get("name"),
+        "event":        event,
+        "priority":     _sb_ui_priority(event, result.get("PRIORITY", "medium").lower()),
+        "message_en":   _sb_message(result, "en"),
+        "message_te":   _sb_message(result, "te"),
+        "person_en":    result.get("PERSON", "none"),
+        "person_te":    result.get("PERSON_TE", "none"),
+        "confidence":   int(result.get("CONFIDENCE", 0) or 0),
+        "snapshot_url": snapshot_url,
+        "night":        bool(is_night),
+    }
+    try:
+        r = requests.post(
+            f"{SB_URL}/rest/v1/events",
+            headers=_sb_headers({"Content-Type": "application/json",
+                                 "Prefer": "return=minimal"}),
+            json=row, timeout=10)
+        if r.status_code not in (200, 201, 204):
+            log.warning(f"SB insert {r.status_code}: {r.text[:140]}")
+    except Exception as e:
+        log.warning(f"SB insert: {e}")
+
+
+def sb_push_detection(camera: dict, result: dict, eid: str,
+                      img: Image.Image, is_night: bool):
+    """Best-effort: upload snapshot + insert the detection row."""
+    if not SB_ENABLED:
+        return
+    snap_url = None
+    try:
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=80)
+        snap_url = _sb_upload_snapshot(eid, buf.getvalue())
+    except Exception as e:
+        log.warning(f"SB snapshot encode: {e}")
+    _sb_insert_event(camera, result, eid, is_night, snap_url)
+
+
+def push_config_to_supabase():
+    """Seed the Supabase `config` row from the phone at startup so the
+    dashboard shows cameras + current settings."""
+    if not SB_ENABLED:
+        return
+    data = {
+        "cameras": [
+            {"id": c["id"], "name": c["name"], "location": c.get("location", ""),
+             "enabled": c.get("enabled", True), "motion_threshold": c.get("motion_threshold", 8.0)}
+            for c in CAMERAS
+        ],
+        "monitoring": {
+            "active": MON.get("active", True),
+            "scan_interval_sec": SCAN_INTERVAL, "min_alert_gap_sec": ALERT_GAP,
+            "active_hours": ACTIVE_HOURS, "night_mode": MON.get("night_mode", False),
+            "event_log_keep_days": LOG_KEEP_DAYS,
+            "quiet_gap_sec": QUIET_GAP_SEC, "episode_reminder_sec": EP_REMINDER_SEC,
+            "alert_on_description_change": ALERT_ON_DESC_CHANGE,
+        },
+        "ntfy":   {"enabled": NTFY_ENABLED, "server": NTFY_SERVER, "topic": NTFY_TOPIC},
+        "gemini": {"model": GEMINI_MODEL, "temperature": GEMINI_TEMP},
+        "notifications": {"languages": NOTIFY_LANGS, "attach_snapshot": ATTACH_SNAP},
+        "family_members": FAMILY_MEMBERS,
+    }
+    try:
+        r = requests.post(
+            f"{SB_URL}/rest/v1/config?on_conflict=id",
+            headers=_sb_headers({"Content-Type": "application/json",
+                                 "Prefer": "resolution=merge-duplicates,return=minimal"}),
+            json={"id": 1, "data": data}, timeout=10)
+        if r.status_code in (200, 201, 204):
+            log.info("✅ Config pushed to Supabase")
+        else:
+            log.warning(f"SB config seed {r.status_code}: {r.text[:160]}")
+    except Exception as e:
+        log.warning(f"SB config seed: {e}")
+
 
 # ═══════════════════════════════════════════════════════════════════════
 #  STORAGE
@@ -930,6 +1221,10 @@ def save_event(camera: dict, result: dict, score: float,
         "night":        is_night,
         "ir_mode":      ir,
     }
+    for code in SECONDARY_LANGS:
+        up = code.upper()
+        rec[f"summary_{code}"] = result.get(f"SUMMARY_{up}", "")
+        rec[f"person_{code}"]  = result.get(f"PERSON_{up}",  "none")
     try:
         with _elog_lock:
             with open(EVENT_LOG, "a") as f:
@@ -1237,13 +1532,9 @@ class CameraWatcher:
         self.alerts = 0
         self.cfails = 0
         self._cd: dict[str, float] = cooldown or {}
-        self._last_key = ""
 
     def cd_snap(self) -> dict:
         return dict(self._cd)
-
-    def _can(self, evt: str) -> bool:
-        return time.time() - self._cd.get(evt, 0) >= ALERT_GAP
 
     def _mark(self, evt: str):
         self._cd[evt] = time.time()
@@ -1255,12 +1546,20 @@ class CameraWatcher:
             log.warning(f"[{self.name}] {self.cfails} RTSP fails — wait {w}s")
         time.sleep(w)
 
-    def _is_dup(self, result: dict) -> bool:
-        key = f"{result.get('EVENT','')}|{result.get('PERSON','').lower()}"
-        if key == self._last_key:
-            return True
-        self._last_key = key
-        return False
+    def _gate_alert(self, event: str, result: dict) -> tuple[bool, str]:
+        """Decide whether this detection should actually notify.
+        People use episode debouncing; intruders always alert; the rest
+        keep a simple per-event cooldown."""
+        now = time.time()
+        if event == "person_detected":
+            return _episode_gate(self.cid, result.get("PERSON", ""), now)
+        if event == "intruder_detected":
+            if now - self._cd.get(event, 0) >= ALERT_GAP:
+                return True, "intruder"
+            return False, "intruder cooldown"
+        if now - self._cd.get(event, 0) >= ALERT_GAP:
+            return True, event
+        return False, f"{event} cooldown"
 
     def _process(self, img: Image.Image, score: float,
                  is_night: bool, ir: bool):
@@ -1326,21 +1625,21 @@ class CameraWatcher:
             log.info(f"[{self.name}] Conf {conf}% < {mc}% — skip")
             return
 
-        if self._is_dup(result):
-            log.info(f"[{self.name}] Duplicate — skip")
-            return
-
         if is_paused(self.cid):
             log.info(f"[{self.name}] Paused — skip notify")
             return
 
-        if self._can(event):
-            send_notifications(self.cam, result, frames[0], score)
-            self._mark(event)
-            self.alerts += 1
-        else:
-            rem = int(ALERT_GAP - (time.time() - self._cd.get(event, 0)))
-            log.info(f"[{self.name}] Cooldown {event} — {rem}s")
+        ok, reason = self._gate_alert(event, result)
+        if not ok:
+            log.info(f"[{self.name}] {event} suppressed — {reason}")
+            return
+
+        # Cloud (dashboard log) + ntfy together, so the UI mirrors the alerts.
+        sb_push_detection(self.cam, result, eid, frames[0], is_night)
+        send_notifications(self.cam, result, frames[0], score)
+        self._mark(event)
+        self.alerts += 1
+        log.info(f"[{self.name}] ALERT sent — {reason}")
 
     def run(self):
         log.info(f"[{self.name}] Watcher started (thresh={self.thresh})")
@@ -1468,6 +1767,10 @@ def run_test(cam_id: str):
     print(f"\n{'─'*52}")
     for k in ["EVENT", "ALERT", "SUMMARY", "PERSON", "PRIORITY", "CONFIDENCE"]:
         print(f"  {k:<12}: {result.get(k, '—')}")
+    for code in SECONDARY_LANGS:
+        up = code.upper()
+        print(f"  {('SUMMARY_'+up):<12}: {result.get('SUMMARY_'+up, '—')}")
+        print(f"  {('PERSON_'+up):<12}: {result.get('PERSON_'+up, '—')}")
 
     body = _build_body(cam, result, 0)
     print(f"\n  📱 Notification preview:")
@@ -1592,11 +1895,13 @@ def main():
     log.info(f"  Multi-frame : {MULTI_FRAMES} × {MULTI_INTERVAL_MS}ms")
     log.info(f"  Family      : {len(FAMILY_MEMBERS)} members")
     log.info(f"  Ntfy        : {'✅ ' + NTFY_TOPIC if NTFY_ENABLED else '❌'}")
+    log.info(f"  Supabase    : {'✅ cloud sync on' if SB_ENABLED else '❌ local only'}")
     log.info(f"  Heartbeat   : every {HEARTBEAT_SEC//3600}h")
     log.info(f"  Disk        : {free:.0f} MB free")
     log.info("─" * 52)
 
     _replay_pending()
+    push_config_to_supabase()
     Thread(target=bg_daily,     daemon=True, name="daily").start()
     Thread(target=bg_heartbeat, daemon=True, name="heartbeat").start()
 

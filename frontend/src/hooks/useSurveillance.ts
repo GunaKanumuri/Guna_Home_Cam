@@ -1,122 +1,170 @@
-import { useState, useEffect, useCallback } from 'react';
-import type { SurveillanceEvent, SystemState, CameraInfo, DashboardConfig } from '../types';
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { supabase } from '../lib/supabase';
+import type {
+    SurveillanceEvent, SystemState, CameraInfo, DashboardConfig, PriorityLevel,
+} from '../types';
 
-const API_BASE_URL = "http://192.168.0.108:5000/api";
-
-const DEFAULT_CAMERAS: CameraInfo[] = [
-    { id: 'cam1', name: 'Main Gate',    location: 'Ground floor main gate & street entrance',     enabled: true, motion_threshold: 8.5, status: 'online', lastActivity: '—' },
-    { id: 'cam2', name: 'Ground Floor', location: 'Front door & staircase to first floor',        enabled: true, motion_threshold: 7.0, status: 'online', lastActivity: '—' },
-    { id: 'cam3', name: 'First Floor',  location: 'Main door, balcony & staircase to 2nd floor', enabled: true, motion_threshold: 7.0, status: 'online', lastActivity: '—' },
-];
+/* ── Supabase row shape (table: public.events) ── */
+interface DbEvent {
+    id: number;
+    event_id: string | null;
+    camera_id: string | null;
+    camera: string | null;
+    event: string | null;
+    priority: string | null;
+    message_en: string | null;
+    message_te: string | null;
+    person_en: string | null;
+    person_te: string | null;
+    confidence: number | null;
+    snapshot_url: string | null;
+    night: boolean | null;
+    created_at: string;
+}
 
 const DEFAULT_CONFIG: DashboardConfig = {
-    cameras: DEFAULT_CAMERAS.map(c => ({ id: c.id, name: c.name, location: c.location, enabled: c.enabled, motion_threshold: c.motion_threshold })),
-    monitoring: { active: true, scan_interval_sec: 15, min_alert_gap_sec: 60, active_hours: [6, 23], night_mode: false, event_log_keep_days: 90 },
-    ntfy:   { enabled: true, server: 'https://ntfy.sh', topic: 'guna-home-cams' },
+    cameras: [],
+    monitoring: { active: true, scan_interval_sec: 15, min_alert_gap_sec: 60, active_hours: [0, 23], night_mode: false, event_log_keep_days: 90 },
+    ntfy:   { enabled: true, server: 'https://ntfy.sh', topic: '' },
     gemini: { model: 'gemini-2.5-flash', temperature: 0.4 },
     family_members: [],
 };
 
+function fmtTime(iso: string): string {
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return iso;
+    return d.toLocaleString('en-IN', {
+        day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', hour12: true,
+    });
+}
+
+function mapEvent(r: DbEvent): SurveillanceEvent {
+    const pr = (['safe', 'warning', 'urgent'].includes(r.priority || '') ? r.priority : 'safe') as PriorityLevel;
+    return {
+        id: r.id,
+        timestamp: fmtTime(r.created_at),
+        camera: r.camera || r.camera_id || 'Camera',
+        priority: pr,
+        message: r.message_en || r.event || 'Activity detected',
+        message_te: r.message_te || undefined,
+        person: r.person_en || undefined,
+        confidence: r.confidence ?? undefined,
+        hazard: pr === 'urgent',
+        family: null,
+        snapshot_url: r.snapshot_url || undefined,
+    };
+}
+
 export function useSurveillance() {
     const [events, setEvents]           = useState<SurveillanceEvent[]>([]);
+    const [config, setConfig]           = useState<DashboardConfig>(DEFAULT_CONFIG);
+    const [cameras, setCameras]         = useState<CameraInfo[]>([]);
     const [systemState, setSystemState] = useState<SystemState>({ status: 'Active', snooze_until: null });
     const [loading, setLoading]         = useState(true);
     const [connected, setConnected]     = useState(false);
-    const [cameras, setCameras]         = useState<CameraInfo[]>(DEFAULT_CAMERAS);
-    const [config, setConfig]           = useState<DashboardConfig>(DEFAULT_CONFIG);
+    const cfgRef = useRef<DashboardConfig>(DEFAULT_CONFIG);
 
-    const fetchSystemData = useCallback(async () => {
-        try {
-            const [eventsRes, statusRes, configRes] = await Promise.all([
-                fetch(`${API_BASE_URL}/events`),
-                fetch(`${API_BASE_URL}/status`),
-                fetch(`${API_BASE_URL}/config`),
-            ]);
-
-            if (eventsRes.ok) setEvents(await eventsRes.json());
-            if (statusRes.ok) setSystemState(await statusRes.json());
-
-            if (configRes.ok) {
-                const cfg: DashboardConfig = await configRes.json();
-                setConfig(cfg);
-                setCameras(cfg.cameras.map(c => ({
-                    ...c,
-                    status: c.enabled ? 'online' as const : 'offline' as const,
-                    lastActivity: '—',
-                })));
-            }
-
-            setConnected(true);
-        } catch {
-            setConnected(false);
-        } finally {
-            setLoading(false);
-        }
+    const applyConfig = useCallback((cfg: DashboardConfig) => {
+        cfgRef.current = cfg;
+        setConfig(cfg);
+        setCameras((cfg.cameras || []).map(c => ({
+            ...c,
+            status: c.enabled ? 'online' as const : 'offline' as const,
+            lastActivity: '—',
+        })));
+        setSystemState({ status: cfg.monitoring?.active === false ? 'Off' : 'Active', snooze_until: null });
     }, []);
 
+    const loadConfig = useCallback(async () => {
+        const { data, error } = await supabase.from('config').select('data').eq('id', 1).maybeSingle();
+        if (!error && data?.data) applyConfig({ ...DEFAULT_CONFIG, ...(data.data as DashboardConfig) });
+    }, [applyConfig]);
+
+    const loadEvents = useCallback(async () => {
+        const { data, error } = await supabase
+            .from('events').select('*').order('created_at', { ascending: false }).limit(500);
+        if (!error && data) setEvents((data as DbEvent[]).map(mapEvent));
+    }, []);
+
+    // Initial load + realtime subscription (+ polling fallback)
     useEffect(() => {
-        fetchSystemData();
-        const iv = setInterval(fetchSystemData, 5000);
-        return () => clearInterval(iv);
-    }, [fetchSystemData]);
+        let active = true;
+        (async () => {
+            await Promise.all([loadEvents(), loadConfig()]);
+            if (active) { setConnected(true); setLoading(false); }
+            // Realtime evaluates RLS with the socket's token — make sure it's ours,
+            // otherwise is_member() is false and no rows are delivered.
+            const { data: { session } } = await supabase.auth.getSession();
+            if (session) supabase.realtime.setAuth(session.access_token);
+        })();
+
+        // Unique channel name avoids a StrictMode double-mount collision in dev.
+        const channel = supabase
+            .channel(`events-stream-${Math.random().toString(36).slice(2)}`)
+            .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'events' },
+                payload => setEvents(prev => {
+                    const ev = mapEvent(payload.new as DbEvent);
+                    if (prev.some(e => e.id === ev.id)) return prev;
+                    return [ev, ...prev].slice(0, 500);
+                }))
+            .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'config' },
+                () => loadConfig())
+            .subscribe(status => console.log('[realtime]', status));
+
+        // Safety net: refetch every 10s so the log updates even if the socket is blocked.
+        const poll = setInterval(() => { loadEvents(); }, 10000);
+
+        return () => { active = false; clearInterval(poll); supabase.removeChannel(channel); };
+    }, [loadEvents, loadConfig]);
+
+    const writeConfig = useCallback(async (next: DashboardConfig) => {
+        const { error } = await supabase.from('config')
+            .update({ data: next, updated_at: new Date().toISOString() }).eq('id', 1);
+        if (error) return { ok: false, message: error.message };
+        applyConfig(next);
+        return { ok: true };
+    }, [applyConfig]);
 
     const toggleSystemPower = async () => {
-        try {
-            const res = await fetch(`${API_BASE_URL}/toggle`, { method: 'POST' });
-            if (res.ok) {
-                const data = await res.json();
-                setSystemState(prev => ({ ...prev, status: data.status }));
-            }
-        } catch {
-            setSystemState(prev => ({ ...prev, status: prev.status === 'Active' ? 'Off' : 'Active' }));
-        }
+        const cur = cfgRef.current;
+        const next: DashboardConfig = {
+            ...cur, monitoring: { ...cur.monitoring, active: cur.monitoring?.active === false },
+        };
+        await writeConfig(next);
     };
 
     const updateConfig = async (updates: Record<string, unknown>): Promise<{ ok: boolean; message?: string }> => {
-        try {
-            const res = await fetch(`${API_BASE_URL}/config`, {
-                method: 'PUT',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(updates),
-            });
-            const data = await res.json();
-            if (res.ok) { await fetchSystemData(); return { ok: true, message: data.message }; }
-            return { ok: false, message: data.error };
-        } catch {
-            return { ok: false, message: 'Failed to reach server' };
-        }
+        const cur = cfgRef.current;
+        const u = updates as Partial<DashboardConfig>;
+        const next: DashboardConfig = {
+            ...cur,
+            monitoring: { ...cur.monitoring, ...(u.monitoring || {}) },
+            ntfy:       { ...cur.ntfy,       ...(u.ntfy || {}) },
+            cameras:    u.cameras
+                ? cur.cameras.map(c => {
+                    const upd = (u.cameras as DashboardConfig['cameras']).find(x => x.id === c.id);
+                    return upd ? { ...c, ...upd } : c;
+                })
+                : cur.cameras,
+        };
+        const r = await writeConfig(next);
+        return r.ok ? { ok: true, message: 'Settings saved.' } : r;
     };
 
     const purgeEvents = async (days = 7): Promise<{ ok: boolean; removed?: number; message?: string }> => {
-        try {
-            const res = await fetch(`${API_BASE_URL}/events/purge`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ days }),
-            });
-            const data = await res.json();
-            if (res.ok) { await fetchSystemData(); return { ok: true, removed: data.removed }; }
-            return { ok: false, message: data.error };
-        } catch {
-            return { ok: false, message: 'Failed to reach server' };
-        }
+        const cutoff = new Date(Date.now() - days * 86400_000).toISOString();
+        const { error } = await supabase.from('events').delete().lt('created_at', cutoff);
+        if (error) return { ok: false, message: error.message };
+        await loadEvents();
+        return { ok: true };
     };
 
     const sendFamilyAlert = async (message?: string): Promise<{ ok: boolean; message?: string }> => {
-        try {
-            const res = await fetch(`${API_BASE_URL}/alert`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    title: 'Home Guard Family Alert',
-                    message: message || '🚨 Manual alert from Home Guard dashboard',
-                }),
-            });
-            const data = await res.json();
-            return { ok: res.ok, message: data.message || data.error };
-        } catch {
-            return { ok: false, message: 'Failed to reach server' };
-        }
+        const { error } = await supabase.rpc('raise_alert', {
+            p_message: message || '🚨 Manual alert from the family dashboard',
+        });
+        if (error) return { ok: false, message: error.message };
+        return { ok: true, message: 'Alert raised for everyone.' };
     };
 
     return {

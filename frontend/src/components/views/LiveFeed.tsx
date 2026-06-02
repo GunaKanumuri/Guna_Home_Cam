@@ -261,7 +261,7 @@ export default function LiveFeed({ events, connected }: Props) {
                                                 { label: 'Priority', value: event.priority.charAt(0).toUpperCase() + event.priority.slice(1),
                                                   color: event.priority === 'urgent' ? 'text-ruby' : event.priority === 'warning' ? 'text-amber-600' : 'text-gold-600' },
                                                 { label: 'Hazard',   value: event.hazard ? 'Yes ⚠️' : 'No' },
-                                                { label: 'Family',   value: event.family || 'None detected' },
+                                                { label: 'Confidence', value: event.confidence != null ? `${event.confidence}%` : '—' },
                                                 { label: 'Event ID', value: `#${event.id}` },
                                             ].map(f => (
                                                 <div key={f.label}>
@@ -274,7 +274,17 @@ export default function LiveFeed({ events, connected }: Props) {
                                         <div className="mt-3 pt-3 border-t border-warm-100">
                                             <p className="text-[9px] font-mono text-warm-300 uppercase tracking-wider mb-1">Full Description</p>
                                             <p className="text-sm text-warm-700 leading-relaxed">{event.message}</p>
+                                            {event.message_te && (
+                                                <p className="text-sm text-warm-500 leading-relaxed mt-1">{event.message_te}</p>
+                                            )}
                                         </div>
+                                        {event.snapshot_url && (
+                                            <div className="mt-3">
+                                                <p className="text-[9px] font-mono text-warm-300 uppercase tracking-wider mb-1.5">Snapshot</p>
+                                                <img src={event.snapshot_url} alt="snapshot" loading="lazy"
+                                                    className="w-full max-w-xs rounded-xl border border-warm-100" />
+                                            </div>
+                                        )}
                                     </div>
                                 )}
                             </div>
