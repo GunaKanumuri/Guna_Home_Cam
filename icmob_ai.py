@@ -1158,10 +1158,21 @@ def sb_push_detection(camera: dict, result: dict, eid: str,
 
 
 def push_config_to_supabase():
-    """Seed the Supabase `config` row from the phone at startup so the
-    dashboard shows cameras + current settings."""
+    """Seed the Supabase `config` row from the phone — ONLY if it's empty.
+    Never overwrite settings someone changed from the dashboard."""
     if not SB_ENABLED:
         return
+    try:
+        chk = requests.get(f"{SB_URL}/rest/v1/config?id=eq.1&select=data",
+                           headers=_sb_headers(), timeout=10)
+        if chk.status_code == 200:
+            rows = chk.json()
+            existing = rows[0].get("data") if rows else None
+            if existing and existing.get("cameras"):
+                log.info("Supabase config already set — keeping dashboard settings")
+                return
+    except Exception as e:
+        log.warning(f"SB config check: {e}")
     data = {
         "cameras": [
             {"id": c["id"], "name": c["name"], "location": c.get("location", ""),
