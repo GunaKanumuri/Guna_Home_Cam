@@ -40,6 +40,9 @@ export interface DashboardConfig {
         active_hours: [number, number];
         night_mode: boolean;
         event_log_keep_days: number;
+        quiet_gap_sec?: number;
+        episode_reminder_sec?: number;
+        alert_on_description_change?: boolean;
     };
     ntfy: {
         enabled: boolean;
@@ -49,6 +52,10 @@ export interface DashboardConfig {
     gemini: {
         model: string;
         temperature: number;
+    };
+    notifications?: {
+        languages: string[];
+        attach_snapshot: boolean;
     };
     family_members: string[];
 }

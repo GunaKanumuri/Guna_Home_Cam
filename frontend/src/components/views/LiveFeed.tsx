@@ -5,6 +5,8 @@ import type { SurveillanceEvent } from '../../types';
 interface Props { events: SurveillanceEvent[]; connected: boolean; }
 type Filter = 'all' | 'alerts' | 'family';
 
+const PAGE_SIZE = 20;
+
 const P = {
     urgent:  { bar: 'bg-ruby',      dot: 'bg-ruby shadow-[0_0_6px_rgba(184,58,46,0.4)]', badge: 'bg-ruby-light text-ruby border-ruby-border',   label: 'URGENT' },
     warning: { bar: 'bg-amber-400', dot: 'bg-amber-400',                                  badge: 'bg-amber-50 text-amber-600 border-amber-200',   label: 'WARN'   },
@@ -27,10 +29,11 @@ function exportCSV(events: SurveillanceEvent[]) {
 }
 
 export default function LiveFeed({ events, connected }: Props) {
-    const [filter, setFilter]       = useState<Filter>('all');
-    const [search, setSearch]       = useState('');
+    const [filter, setFilter]             = useState<Filter>('all');
+    const [search, setSearch]             = useState('');
     const [cameraFilter, setCameraFilter] = useState('all');
     const [expandedId, setExpandedId]     = useState<number | null>(null);
+    const [visibleCount, setVisibleCount] = useState(PAGE_SIZE);
 
     // Unique camera names for the camera filter dropdown
     const cameras = useMemo(() =>
@@ -53,16 +56,30 @@ export default function LiveFeed({ events, connected }: Props) {
         return true;
     }), [events, filter, cameraFilter, search]);
 
+    // Reset visible count whenever filters change
+    const visibleEvents = useMemo(() => {
+        return filtered.slice(0, visibleCount);
+    }, [filtered, visibleCount]);
+
     const urgentCnt  = events.filter(e => e.priority === 'urgent').length;
     const warnCnt    = events.filter(e => e.priority === 'warning').length;
     const familyCnt  = events.filter(e => e.family !== null).length;
     const isFiltered = filter !== 'all' || cameraFilter !== 'all' || search.trim() !== '';
 
+    const hasMore = visibleCount < filtered.length;
+    const remaining = filtered.length - visibleCount;
+
     const clearFilters = () => {
         setFilter('all');
         setCameraFilter('all');
         setSearch('');
+        setVisibleCount(PAGE_SIZE);
     };
+
+    // Reset pagination when filters change
+    const handleFilterChange = (f: Filter) => { setFilter(f); setVisibleCount(PAGE_SIZE); };
+    const handleCameraChange = (c: string) => { setCameraFilter(c); setVisibleCount(PAGE_SIZE); };
+    const handleSearchChange = (s: string) => { setSearch(s); setVisibleCount(PAGE_SIZE); };
 
     const tabs: { key: Filter; label: string; count: number }[] = [
         { key: 'all',    label: 'All Logs', count: events.length },
@@ -129,12 +146,12 @@ export default function LiveFeed({ events, connected }: Props) {
                 </svg>
                 <input
                     value={search}
-                    onChange={e => setSearch(e.target.value)}
+                    onChange={e => handleSearchChange(e.target.value)}
                     placeholder="Search events, cameras, family members..."
                     className="w-full bg-white border border-warm-200 text-sm text-warm-800 pl-10 pr-4 py-2.5 rounded-xl outline-none focus:ring-2 focus:ring-gold-200 focus:border-gold-300 transition-all placeholder-warm-300"
                 />
                 {search && (
-                    <button onClick={() => setSearch('')} className="absolute right-3 top-1/2 -translate-y-1/2 text-warm-300 hover:text-warm-500">
+                    <button onClick={() => handleSearchChange('')} className="absolute right-3 top-1/2 -translate-y-1/2 text-warm-300 hover:text-warm-500">
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
                     </button>
                 )}
@@ -145,7 +162,7 @@ export default function LiveFeed({ events, connected }: Props) {
                 {/* Priority tabs */}
                 <div className="flex bg-white p-1 rounded-xl border border-warm-100 shadow-sm">
                     {tabs.map(t => (
-                        <button key={t.key} onClick={() => setFilter(t.key)}
+                        <button key={t.key} onClick={() => handleFilterChange(t.key)}
                             className={`px-3 py-1.5 text-xs font-semibold rounded-lg transition-all flex items-center gap-1.5 ${
                                 filter === t.key
                                     ? 'bg-gradient-to-r from-gold-400 to-gold-500 text-white shadow-sm'
@@ -162,7 +179,7 @@ export default function LiveFeed({ events, connected }: Props) {
                 {/* Camera dropdown */}
                 <select
                     value={cameraFilter}
-                    onChange={e => setCameraFilter(e.target.value)}
+                    onChange={e => handleCameraChange(e.target.value)}
                     className="bg-white border border-warm-200 text-xs font-semibold text-warm-600 px-3 py-2 rounded-xl outline-none focus:ring-2 focus:ring-gold-200 transition-all"
                 >
                     {cameras.map(c => (
@@ -179,12 +196,13 @@ export default function LiveFeed({ events, connected }: Props) {
                     </button>
                 )}
 
-                {/* Result count when filtered */}
-                {isFiltered && (
-                    <span className="text-xs text-warm-400 font-mono ml-auto">
-                        {filtered.length} of {events.length} events
-                    </span>
-                )}
+                {/* Result count */}
+                <span className="text-xs text-warm-400 font-mono ml-auto">
+                    {isFiltered
+                        ? `${filtered.length} of ${events.length} events`
+                        : `${events.length} events`
+                    }
+                </span>
             </div>
 
             {/* ── Event list ── */}
@@ -198,98 +216,133 @@ export default function LiveFeed({ events, connected }: Props) {
                         </button>
                     </div>
                 ) : (
-                    filtered.map((event, idx) => {
-                        const cfg        = P[event.priority];
-                        const isExpanded = expandedId === event.id;
-                        return (
-                            <div key={event.id}
-                                onClick={() => setExpandedId(isExpanded ? null : event.id)}
-                                className={`group relative lux-card overflow-hidden cursor-pointer transition-all duration-200 animate-slide-up ${
-                                    event.priority === 'urgent' ? '!border-ruby-border !bg-ruby-light' :
-                                    event.priority === 'warning' ? '!border-amber-200 !bg-amber-50/40' : ''
-                                }`}
-                                style={{ animationDelay: `${idx * 30}ms` }}
-                            >
-                                {/* Priority bar */}
-                                <div className={`absolute left-0 top-0 bottom-0 w-1 ${cfg.bar}`} />
+                    <>
+                        {visibleEvents.map((event, idx) => {
+                            const cfg        = P[event.priority];
+                            const isExpanded = expandedId === event.id;
+                            return (
+                                <div key={event.id}
+                                    onClick={() => setExpandedId(isExpanded ? null : event.id)}
+                                    className={`group relative lux-card overflow-hidden cursor-pointer transition-all duration-200 animate-slide-up ${
+                                        event.priority === 'urgent' ? '!border-ruby-border !bg-ruby-light' :
+                                        event.priority === 'warning' ? '!border-amber-200 !bg-amber-50/40' : ''
+                                    }`}
+                                    style={{ animationDelay: `${idx * 30}ms` }}
+                                >
+                                    {/* Priority bar */}
+                                    <div className={`absolute left-0 top-0 bottom-0 w-1 ${cfg.bar}`} />
 
-                                {/* Main row */}
-                                <div className="flex items-center gap-4 p-4 pl-5">
-                                    <div className="w-28 shrink-0">
-                                        <span className="text-[10px] font-mono text-warm-400">{event.timestamp}</span>
-                                        <p className="text-xs font-semibold text-warm-700 truncate mt-0.5">{event.camera}</p>
-                                    </div>
-
-                                    <div className={`w-2 h-2 rounded-full shrink-0 ${cfg.dot}`} />
-
-                                    <p className="flex-1 text-sm text-warm-600 group-hover:text-warm-800 transition-colors leading-snug">
-                                        {/* Highlight search term */}
-                                        {search.trim()
-                                            ? event.message.split(new RegExp(`(${search})`, 'gi')).map((part, i) =>
-                                                part.toLowerCase() === search.toLowerCase()
-                                                    ? <mark key={i} className="bg-gold-200 text-warm-800 rounded px-0.5">{part}</mark>
-                                                    : part
-                                              )
-                                            : event.message
-                                        }
-                                    </p>
-
-                                    <div className="shrink-0 flex flex-col items-end gap-1.5">
-                                        <span className={`text-[9px] font-mono font-bold px-2 py-0.5 rounded border ${cfg.badge}`}>
-                                            {cfg.label}
-                                        </span>
-                                        {event.family && (
-                                            <span className="text-[9px] font-mono px-2 py-0.5 rounded border bg-blue-50 text-blue-600 border-blue-200">
-                                                {event.family.toUpperCase()}
-                                            </span>
-                                        )}
-                                    </div>
-
-                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
-                                        className={`text-warm-300 shrink-0 transition-transform duration-200 ${isExpanded ? 'rotate-180' : ''}`}>
-                                        <polyline points="6 9 12 15 18 9"/>
-                                    </svg>
-                                </div>
-
-                                {/* Expanded detail */}
-                                {isExpanded && (
-                                    <div className="px-5 pb-4 border-t border-warm-100 animate-fade-in">
-                                        <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 pt-3">
-                                            {[
-                                                { label: 'Camera',   value: event.camera },
-                                                { label: 'Time',     value: event.timestamp },
-                                                { label: 'Priority', value: event.priority.charAt(0).toUpperCase() + event.priority.slice(1),
-                                                  color: event.priority === 'urgent' ? 'text-ruby' : event.priority === 'warning' ? 'text-amber-600' : 'text-gold-600' },
-                                                { label: 'Hazard',   value: event.hazard ? 'Yes ⚠️' : 'No' },
-                                                { label: 'Confidence', value: event.confidence != null ? `${event.confidence}%` : '—' },
-                                                { label: 'Event ID', value: `#${event.id}` },
-                                            ].map(f => (
-                                                <div key={f.label}>
-                                                    <p className="text-[9px] font-mono text-warm-300 uppercase tracking-wider">{f.label}</p>
-                                                    <p className={`text-xs font-semibold mt-0.5 ${'color' in f ? f.color : 'text-warm-700'}`}>{f.value}</p>
-                                                </div>
-                                            ))}
+                                    {/* Main row */}
+                                    <div className="flex items-center gap-4 p-4 pl-5">
+                                        <div className="w-28 shrink-0">
+                                            <span className="text-[10px] font-mono text-warm-400">{event.timestamp}</span>
+                                            <p className="text-xs font-semibold text-warm-700 truncate mt-0.5">{event.camera}</p>
                                         </div>
-                                        {/* Full message */}
-                                        <div className="mt-3 pt-3 border-t border-warm-100">
-                                            <p className="text-[9px] font-mono text-warm-300 uppercase tracking-wider mb-1">Full Description</p>
-                                            <p className="text-sm text-warm-700 leading-relaxed">{event.message}</p>
-                                            {event.message_te && (
-                                                <p className="text-sm text-warm-500 leading-relaxed mt-1">{event.message_te}</p>
+
+                                        <div className={`w-2 h-2 rounded-full shrink-0 ${cfg.dot}`} />
+
+                                        <p className="flex-1 text-sm text-warm-600 group-hover:text-warm-800 transition-colors leading-snug">
+                                            {search.trim()
+                                                ? event.message.split(new RegExp(`(${search})`, 'gi')).map((part, i) =>
+                                                    part.toLowerCase() === search.toLowerCase()
+                                                        ? <mark key={i} className="bg-gold-200 text-warm-800 rounded px-0.5">{part}</mark>
+                                                        : part
+                                                  )
+                                                : event.message
+                                            }
+                                        </p>
+
+                                        <div className="shrink-0 flex flex-col items-end gap-1.5">
+                                            <span className={`text-[9px] font-mono font-bold px-2 py-0.5 rounded border ${cfg.badge}`}>
+                                                {cfg.label}
+                                            </span>
+                                            {event.family && (
+                                                <span className="text-[9px] font-mono px-2 py-0.5 rounded border bg-blue-50 text-blue-600 border-blue-200">
+                                                    {event.family.toUpperCase()}
+                                                </span>
                                             )}
                                         </div>
-                                        {event.snapshot_url && (
-                                            <div className="mt-3">
-                                                <p className="text-[9px] font-mono text-warm-300 uppercase tracking-wider mb-1.5">Snapshot</p>
-                                                <img src={event.snapshot_url} alt="snapshot" loading="lazy"
-                                                    className="w-full max-w-xs rounded-xl border border-warm-100" />
-                                            </div>
-                                        )}
+
+                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
+                                            className={`text-warm-300 shrink-0 transition-transform duration-200 ${isExpanded ? 'rotate-180' : ''}`}>
+                                            <polyline points="6 9 12 15 18 9"/>
+                                        </svg>
                                     </div>
-                                )}
+
+                                    {/* Expanded detail */}
+                                    {isExpanded && (
+                                        <div className="px-5 pb-4 border-t border-warm-100 animate-fade-in">
+                                            <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 pt-3">
+                                                {[
+                                                    { label: 'Camera',   value: event.camera },
+                                                    { label: 'Time',     value: event.timestamp },
+                                                    { label: 'Priority', value: event.priority.charAt(0).toUpperCase() + event.priority.slice(1),
+                                                      color: event.priority === 'urgent' ? 'text-ruby' : event.priority === 'warning' ? 'text-amber-600' : 'text-gold-600' },
+                                                    { label: 'Hazard',   value: event.hazard ? 'Yes ⚠️' : 'No' },
+                                                    { label: 'Confidence', value: event.confidence != null ? `${event.confidence}%` : '—' },
+                                                    { label: 'Event ID', value: `#${event.id}` },
+                                                ].map(f => (
+                                                    <div key={f.label}>
+                                                        <p className="text-[9px] font-mono text-warm-300 uppercase tracking-wider">{f.label}</p>
+                                                        <p className={`text-xs font-semibold mt-0.5 ${'color' in f ? f.color : 'text-warm-700'}`}>{f.value}</p>
+                                                    </div>
+                                                ))}
+                                            </div>
+                                            <div className="mt-3 pt-3 border-t border-warm-100">
+                                                <p className="text-[9px] font-mono text-warm-300 uppercase tracking-wider mb-1">Full Description</p>
+                                                <p className="text-sm text-warm-700 leading-relaxed">{event.message}</p>
+                                                {event.message_te && (
+                                                    <p className="text-sm text-warm-500 leading-relaxed mt-1">{event.message_te}</p>
+                                                )}
+                                            </div>
+                                            {event.snapshot_url && (
+                                                <div className="mt-3">
+                                                    <p className="text-[9px] font-mono text-warm-300 uppercase tracking-wider mb-1.5">Snapshot</p>
+                                                    <img src={event.snapshot_url} alt="snapshot" loading="lazy"
+                                                        className="w-full max-w-xs rounded-xl border border-warm-100" />
+                                                </div>
+                                            )}
+                                        </div>
+                                    )}
+                                </div>
+                            );
+                        })}
+
+                        {/* ── Load more / See all ── */}
+                        {hasMore && (
+                            <div className="flex items-center gap-3 pt-2">
+                                <button
+                                    onClick={() => setVisibleCount(v => v + PAGE_SIZE)}
+                                    className="flex-1 flex items-center justify-center gap-2 py-3 rounded-xl bg-white border border-warm-200 hover:border-gold-300 hover:bg-gold-50 text-warm-600 hover:text-gold-600 text-xs font-semibold transition-all active:scale-[0.98]"
+                                >
+                                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                                        <polyline points="6 9 12 15 18 9"/>
+                                    </svg>
+                                    Load {Math.min(PAGE_SIZE, remaining)} more
+                                    <span className="font-mono text-warm-400">({remaining} remaining)</span>
+                                </button>
+                                <button
+                                    onClick={() => setVisibleCount(filtered.length)}
+                                    className="px-4 py-3 rounded-xl bg-white border border-warm-200 hover:border-gold-300 hover:bg-gold-50 text-warm-600 hover:text-gold-600 text-xs font-semibold transition-all active:scale-[0.98] whitespace-nowrap"
+                                >
+                                    See all {filtered.length}
+                                </button>
                             </div>
-                        );
-                    })
+                        )}
+
+                        {/* ── Collapse back ── */}
+                        {!hasMore && filtered.length > PAGE_SIZE && (
+                            <button
+                                onClick={() => setVisibleCount(PAGE_SIZE)}
+                                className="w-full flex items-center justify-center gap-2 py-3 rounded-xl bg-white border border-warm-100 text-warm-400 hover:text-warm-600 text-xs font-semibold transition-all active:scale-[0.98]"
+                            >
+                                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                                    <polyline points="18 15 12 9 6 15"/>
+                                </svg>
+                                Collapse list
+                            </button>
+                        )}
+                    </>
                 )}
             </div>
         </div>

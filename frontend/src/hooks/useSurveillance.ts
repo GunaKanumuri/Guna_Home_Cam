@@ -140,6 +140,10 @@ export function useSurveillance() {
             ...cur,
             monitoring: { ...cur.monitoring, ...(u.monitoring || {}) },
             ntfy:       { ...cur.ntfy,       ...(u.ntfy || {}) },
+            notifications: {
+                languages: ['en', 'te'], attach_snapshot: true,
+                ...(cur.notifications || {}), ...(u.notifications || {}),
+            },
             cameras:    u.cameras
                 ? cur.cameras.map(c => {
                     const upd = (u.cameras as DashboardConfig['cameras']).find(x => x.id === c.id);
